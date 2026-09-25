@@ -34,11 +34,22 @@ def _tick_admitted(
     _sched._ensure_cron_dir(lock_dir)
     lock_fd = _sched._acquire_tick_lock(lock_file)
     if lock_fd is None:
+        # Contention. Plain contention by a PROGRESSING holder is the normal mutual-exclusion case
+        # and stays a benign skip — but a holder proven wedged (pid gone, or alive with no progress
+        # past the bound) used to return 0 here too, which the ticker loops recorded as a SUCCESSFUL
+        # tick. That made a 95-minute PRIMARY-store outage invisible: fresh heartbeat, fresh
+        # last-success marker, zero dispatches (#121904). Raise so the failure is recorded.
+        wedged = _sched.describe_tick_lock_wedge(lock_file)
+        if wedged is not None:
+            raise _sched.CronTickLockWedged(wedged)
         return 0
 
     try:
-        # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
+        # Progress checkpoints below are what let a CONTENDING ticker tell this holder apart from a
+        # wedged one: each stamp moves the holder's lease forward, so a skipper that sees no movement
+        # past the bound knows the lock is not merely busy.
         with contextlib.suppress(ImportError):
+            # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
             from agent.estop import check_paused as _estop_check_paused
             if _estop_check_paused("cron", _sched.logger):
                 return 0
@@ -58,6 +69,10 @@ def _tick_admitted(
             _sched._maybe_run_worktree_maintenance()
         except Exception as _wt_exc:
             _sched.logger.debug("Worktree maintenance dispatch failed: %s", _wt_exc)
+
+        # Checkpoint: the pre-dispatch work above (drain, dead-owner reap, worktree GC) is the slowest
+        # part of a tick's scan phase, so a holder parked in it must still look alive.
+        _sched._refresh_tick_lock_progress(lock_file)
 
         due_jobs = _sched.get_due_jobs()
         _sched._sweep_stale_inflight_for_tick(due_jobs)
@@ -81,6 +96,7 @@ def _tick_admitted(
         # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
         # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.
         _sched.advance_next_runs([job["id"] for job in due_jobs])
+        _sched._refresh_tick_lock_progress(lock_file)
 
         _max_workers = _sched._resolve_max_parallel_workers()
         if verbose:
@@ -104,6 +120,8 @@ def _tick_admitted(
             _all_futures.append(fut)
             if not sync:
                 _results.append(True)  # optimistically counted
+        # Checkpoint: dispatch is submitted (or in flight) — the holder is demonstrably progressing.
+        _sched._refresh_tick_lock_progress(lock_file)
 
         if sync:
             for f in concurrent.futures.as_completed(_all_futures):
@@ -112,6 +130,9 @@ def _tick_admitted(
                 except Exception as exc:
                     _sched.logger.error("Cron job future failed: %s", exc)
                     _results.append(False)
+                # Per-future checkpoint: a long manual `hermes cron tick` running a single slow job
+                # must keep looking alive for the whole run, not just at submission.
+                _sched._refresh_tick_lock_progress(lock_file)
             _sched._sweep_mcp_orphans()
             return sum(_results)
 

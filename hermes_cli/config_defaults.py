@@ -1840,6 +1840,12 @@ DEFAULT_CONFIG = {
         # silences a signature for good. 0 = re-alert on every failing run. Keep in sync with
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
+        # Silence after which a cron tick-lock holder that is still alive is reported WEDGED, so a
+        # contention skip stops being recorded as a successful tick (#121904). The effective bound is
+        # max(this, 3 x HERMES_CRON_TIMEOUT); lower it for a faster signal if you never run long
+        # manual `hermes cron tick` runs. Keep in sync with
+        # cron.scheduler.DEFAULT_TICK_LOCK_WEDGE_SECONDS.
+        "tick_lock_wedge_seconds": 1800,
     },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per

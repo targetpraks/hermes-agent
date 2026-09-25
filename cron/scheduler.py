@@ -189,6 +189,38 @@ class CronTickYielded(RuntimeError):
 _STALE_YIELD_RE = re.compile(r"stale code: booted on (\S+), disk is at (\S+)\)")
 
 
+class CronTickLockWedged(RuntimeError):
+    """This tick could not take ``.tick.lock`` because the holder looks WEDGED.
+
+    Raised instead of the old clean ``return 0`` so both ticker loops record a FAILED tick
+    (``record_ticker_error`` + ``success=False`` heartbeat) and ``hermes cron status`` cannot be
+    green while it is raised — the exact blind spot that hid a 95-minute PRIMARY-store outage
+    (fresh heartbeat + fresh last-success marker, zero dispatches) from every signal an operator
+    reads (#121904).
+
+    Only raised when the holder's own published lease proves it cannot be progressing: its pid is
+    gone, or it is alive but has not stamped progress for longer than
+    ``tick_lock_wedge_bound_seconds()``. Plain contention by a progressing holder still returns 0
+    silently — that is the mutual-exclusion contract, not a failure.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def tick_lock_wedged_labels(recorded_error: str | None) -> str | None:
+    """The wedge reason when a persisted ``ticker_last_error`` is a ``CronTickLockWedged``, else None.
+
+    ``hermes cron status`` runs in another process and only sees the marker text, so the recorded
+    message is matched by the exception's own class name.
+    """
+    if not recorded_error or not recorded_error.startswith(CronTickLockWedged.__name__):
+        return None
+    _prefix = f"{CronTickLockWedged.__name__}: "
+    return recorded_error[len(_prefix):].strip() or None
+
+
 def stale_code_yield_labels(recorded_error: str | None) -> tuple[str, str] | None:
     """``(boot_rev, disk_rev)`` when a persisted ``ticker_last_error`` is a ``CronTickYielded``.
 
@@ -3875,6 +3907,11 @@ def _acquire_tick_lock(lock_file):
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        # Publish the holder lease now that the lock is OURS: a contender that fails below can then
+        # tell a progressing holder from a wedged one instead of reporting a healthy skip (#121904).
+        # Order matters — the lease is written only after acquisition, so a losing contender never
+        # overwrites the real holder's progress signal.
+        _write_tick_lock_lease(lock_file)
         return lock_fd
     except OSError as exc:
         if lock_fd is not None:
@@ -3895,6 +3932,15 @@ def _acquire_tick_lock(lock_file):
 
 
 def _release_tick_lock(lock_fd) -> None:
+    # Drop our holder lease before unlocking, so the window where the lock is free never carries a
+    # lease naming a process that no longer ticks. Only when the lease is OURS: an inherited fd
+    # released by a fork child must not erase the real holder's progress signal.
+    with contextlib.suppress(Exception):
+        lock_path = getattr(lock_fd, "name", None)
+        if lock_path:
+            lease = _read_tick_lock_lease(lock_path)
+            if lease and int(lease.get("pid") or 0) == os.getpid():
+                _clear_tick_lock_lease(lock_path)
     if fcntl:
         with contextlib.suppress((OSError, IOError)):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -3902,6 +3948,258 @@ def _release_tick_lock(lock_fd) -> None:
         with contextlib.suppress((OSError, IOError)):
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
     lock_fd.close()
+
+
+# --- Tick-lock holder lease (progress signal beside the lock) ----------------------------------
+#
+# A tick that cannot take ``.tick.lock`` returns 0 WITHOUT raising, which both ticker loops record
+# as a SUCCESSFUL cycle: fresh heartbeat, fresh last-success marker, zero dispatches. That made a
+# 95-minute scheduler outage on the PRIMARY store completely invisible (`hermes cron status` green
+# the whole time) while 18 jobs sat overdue (#121904 field incident). The guard added for EMFILE
+# (#87644) covers only the OSError path, never the clean-``return 0`` contention path.
+#
+# Simply recording a failure on contention would be wrong: contention is NORMAL (host gateway
+# multiplexer vs Desktop backend ticker vs a manual ``hermes cron tick`` vs a one-shot
+# ``hermes cron run``) and the holder is usually dispatching fine, so the skip is correct. What has
+# to be distinguished is a lock held by a PROGRESSING ticker from one held past a sane bound by a
+# WEDGED one. The lock cannot answer that (flock has no owner), and the per-store
+# ``ticker_heartbeat`` is not a holder signal at all — every ticker in the store writes it, including
+# the skipper, which is exactly the marker that lied during the outage (#121904).
+#
+# So the HOLDER publishes its own lease beside the lock, atomically on acquisition and refreshed at
+# each checkpoint inside the tick, and the SKIPPER reads it (only ever while the lock is held, which
+# is when it means something). Verdict on a skip:
+#
+#   * no lease / unreadable      -> cannot prove a wedge  -> benign skip  (unchanged behaviour)
+#   * holder pid alive, progress within bound -> progressing -> benign skip
+#   * holder pid gone            -> no tick can release it -> WEDGED (raise)
+#   * holder alive, progress older than bound -> WEDGED (raise)
+#
+# Detection and surfacing only: nothing is killed, no lock is broken. A misclassification is
+# therefore non-destructive — the worst case is a yellow ``cron status`` that clears on the next
+# successful tick.
+# The lease name is derived from the lock file so the two can never drift apart.
+
+_TICK_LOCK_LEASE_SUFFIX = ".owner"
+
+# Default silence after which a lock holder that is still alive is reported WEDGED. Effective bound
+# is ``max(this, 3 x HERMES_CRON_TIMEOUT)``; configurable as ``cron.tick_lock_wedge_seconds``.
+DEFAULT_TICK_LOCK_WEDGE_SECONDS = 1800.0
+
+# Minimum interval between lease progress re-stamps. The multiplexer ticks many profiles a minute
+# and each stamp is an atomic write (temp file + rename), so an unthrottled refresh would add real
+# I/O to the hot path for no diagnostic gain. Anything well under the wedge bound (30 min default)
+# keeps the signal meaningful while cutting write amplification by ~30x at a 60s tick interval.
+_TICK_LOCK_PROGRESS_MIN_INTERVAL_SECONDS = 15.0
+
+
+def _get_tick_lock_lease_path(lock_file) -> Path:
+    """Lease file published by whoever holds *lock_file* (sibling path, never the lock itself)."""
+    return Path(str(lock_file) + _TICK_LOCK_LEASE_SUFFIX)
+
+
+def _read_tick_lock_lease(lock_file) -> Optional[Dict[str, Any]]:
+    """Parsed holder lease beside *lock_file*, or None when absent/unreadable/unstamped.
+
+    Every failure returns None, which callers treat as "cannot prove a wedge" — never as a wedge.
+    """
+    try:
+        raw = _get_tick_lock_lease_path(lock_file).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("pid"):
+        return None
+    return data
+
+
+def _write_tick_lock_lease(lock_file, *, acquired_at: Optional[float] = None) -> None:
+    """Best-effort: stamp this process as the *lock_file* holder (atomic, never torn).
+
+    A lost lease write must never fail the tick it describes — the acquisition that follows this call
+    is the real work, and a missing lease degrades to "cannot prove a wedge" on the skip path.
+    """
+    try:
+        stamp = time.time()
+        payload = {
+            "pid": os.getpid(),
+            "process_started_at": _process_start_time_fingerprint(os.getpid()),
+            "acquired_at": stamp if acquired_at is None else float(acquired_at),
+            "progress_at": stamp,
+        }
+        from utils import atomic_write_text
+
+        atomic_write_text(
+            _get_tick_lock_lease_path(lock_file), json.dumps(payload), tmp_prefix=".tleas_",
+            mode=0o600)
+    except Exception:
+        logger.debug("Tick lock lease write failed", exc_info=True)
+
+
+def _clear_tick_lock_lease(lock_file) -> None:
+    """Drop this holder's lease on release so a stale lease cannot outlive its holder."""
+    with contextlib.suppress(OSError):
+        _get_tick_lock_lease_path(lock_file).unlink()
+
+
+def _refresh_tick_lock_progress(lock_file) -> None:
+    """Stamp forward ``progress_at`` so a concurrent skipper can tell this holder is alive.
+
+    Called at each checkpoint inside the tick. Only touches the file when THIS process owns the
+    lease — a ticker that lost a race must never refresh the real holder's progress signal — and only
+    when the previous stamp is older than ``_TICK_LOCK_PROGRESS_MIN_INTERVAL_SECONDS`` (an unthrottled
+    atomic write per checkpoint is real I/O on a hot path for no diagnostic gain).
+    """
+    lease = _read_tick_lock_lease(lock_file)
+    if not lease or int(lease.get("pid") or 0) != os.getpid():
+        return
+    try:
+        if time.time() - float(lease.get("progress_at") or 0.0) < \
+                _TICK_LOCK_PROGRESS_MIN_INTERVAL_SECONDS:
+            return
+    except (TypeError, ValueError):
+        pass
+    _write_tick_lock_lease(lock_file, acquired_at=lease.get("acquired_at"))
+
+
+def _process_start_time_fingerprint(pid: int) -> Optional[int]:
+    """Pid-reuse-proof start-time reading for *pid* (None when the platform cannot answer)."""
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Cross-process liveness for *pid*, fail-safe: an unprovable answer reads as alive."""
+    try:
+        from gateway.status import _pid_exists
+
+        return bool(_pid_exists(pid))
+    except Exception:
+        return True
+
+
+def tick_lock_wedge_bound_seconds() -> float:
+    """Age past which an unprogressing lock holder is reported WEDGED, derived from live knobs.
+
+    ``max(cron.tick_lock_wedge_seconds, 3 x HERMES_CRON_TIMEOUT)`` — the same "3 x the inactivity
+    limit" reasoning ``cron.executions._live_owner_stale_after_seconds`` uses for a live owner that
+    has gone silent, deliberately WITHOUT that function's 2-hour floor: that floor protects live run
+    owners from *reclamation*, whereas this bound only writes a diagnostic (nothing is reclaimed) and
+    a 2-hour floor would not have surfaced the 95-minute field incident at all.
+    """
+    from cron.jobs import _cron_config_number
+
+    bound = _cron_config_number(
+        "tick_lock_wedge_seconds", DEFAULT_TICK_LOCK_WEDGE_SECONDS, float)
+    try:
+        inactivity = abs(float(_cron_inactivity_seconds()))
+    except Exception:
+        inactivity = 0.0
+    return max(bound, inactivity * 3.0)
+
+
+def describe_tick_lock_wedge(lock_file) -> Optional[str]:
+    """Why the holder of *lock_file* is WEDGED, or None when it is progressing / unknowable.
+
+    Called by a ticker that could NOT take the lock. None means "benign skip" and keeps today's
+    ``success=True`` heartbeat; a returned string means the skip IS a failure and the caller records
+    a failed tick. Every ambiguous case fails open on purpose — a false "healthy" on an odd platform
+    is strictly better than a false alarm on a working scheduler.
+    """
+    lease = _read_tick_lock_lease(lock_file)
+    if lease is None:
+        # No lease: a pre-fix holder, or the lease write was lost. Cannot prove a wedge.
+        return None
+    try:
+        holder_pid = int(lease.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    if holder_pid <= 0:
+        return None
+    try:
+        progress_at = float(lease.get("progress_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if progress_at <= 0.0:
+        return None
+    silence = max(0.0, time.time() - progress_at)
+    bound = tick_lock_wedge_bound_seconds()
+    if silence <= bound:
+        return None  # holder is progressing; this skip is the normal mutual-exclusion case
+    if not _process_is_alive(holder_pid):
+        return (
+            f"Tick lock is held by pid {holder_pid}, which no longer exists — no tick can release "
+            f"it. Scheduler dispatch is blocked until that lock is cleared."
+        )
+    return (
+        f"Tick lock has been held by pid {holder_pid} on {lock_file.name} with no progress for "
+        f"{int(silence)}s (bound {int(bound)}s) — that holder looks wedged, so this tick "
+        f"dispatched nothing. Job schedule advances are stopped until it releases."
+    )
+
+
+def release_orphaned_tick_lock(lock_file) -> bool:
+    """One-shot recovery: clear a lock whose lease proves its holder is GONE.
+
+    Safe by construction — a lease whose pid does not exist cannot be mid-tick, so no live ticker is
+    disturbed. Returns True only when a lock was actually cleared. Deliberately conservative: a lock
+    held by a LIVE process is never touched, however long it has been held (the wedge report covers
+    that case with a human in the loop).
+    """
+    lease = _read_tick_lock_lease(lock_file)
+    if lease is None:
+        return False
+    try:
+        holder_pid = int(lease.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if holder_pid <= 0 or holder_pid == os.getpid():
+        return False
+    if _process_is_alive(holder_pid):
+        return False
+    try:
+        lock_fd = open(lock_file, "a", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not open %s to clear an orphaned lock: %s", lock_file, exc)
+        return False
+    try:
+        if fcntl:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif msvcrt:
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        # Still held by a live descriptor somewhere — not ours to break.
+        with contextlib.suppress(OSError):
+            lock_fd.close()
+        return False
+    except Exception:
+        with contextlib.suppress(OSError):
+            lock_fd.close()
+        return False
+    try:
+        _clear_tick_lock_lease(lock_file)
+        logger.warning(
+            "Cleared orphaned tick lock %s (lease pid %s is gone; no progress can ever resume).",
+            lock_file, holder_pid)
+        return True
+    finally:
+        _release_tick_lock(lock_fd)
+
+
+def tick_lock_holder_pid(lock_file) -> Optional[int]:
+    """Pid named by the current holder lease, or None. Diagnostics/CLI only — never a lock."""
+    lease = _read_tick_lock_lease(lock_file)
+    if lease is None:
+        return None
+    try:
+        pid = int(lease.get("pid") or 0)
+    except (TypeError, ValueError):
+        return None
+    return pid or None
 
 
 def _maybe_reap_dead_owners() -> None:

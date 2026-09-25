@@ -416,6 +416,7 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
     ):
         from cron.scheduler import CronTickYielded
+        from cron.scheduler import CronTickLockWedged
         from cron.scheduler import tick as cron_tick
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
@@ -482,6 +483,12 @@ class InProcessCronScheduler(CronScheduler):
                 if isinstance(e, CronTickYielded):
                     # Expected while a fresh gateway owns the lock; still recorded for status.
                     logger.info("Cron tick yielded: %s", e)
+                elif isinstance(e, CronTickLockWedged):
+                    # The holder cannot be progressing, so "another instance holds the lock" is NOT a
+                    # benign skip: nothing dispatched and nothing will until it is cleared. Log once
+                    # per episode at error level WITHOUT a traceback (this repeats every cycle) and
+                    # let the persisted ticker error carry it to `hermes cron status`.
+                    logger.error("Cron tick blocked: %s", e)
                 else:
                     logger.error("Cron tick error: %s", e, exc_info=True)
                 # Persist the reason so `hermes cron status` (separate process) shows WHY.
@@ -515,7 +522,7 @@ class InProcessCronScheduler(CronScheduler):
         home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
         heartbeated."""
         from cron.scheduler import tick as cron_tick
-        from cron.scheduler import CronTickYielded, _is_fd_exhaustion
+        from cron.scheduler import CronTickLockWedged, CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
             SharedRouteAdapters, _primary_profile_routes_for_current_home,
         )
@@ -603,6 +610,14 @@ class InProcessCronScheduler(CronScheduler):
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)
                             _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                        except CronTickLockWedged as e:
+                            # A wedged holder is a FAILURE for this profile, not a benign skip: the
+                            # per-profile heartbeat below records success=False and the reason is
+                            # persisted, so `hermes cron status` stops being green (#121904).
+                            logger.error("Cron tick blocked for profile at %s: %s", home, e)
+                            _profile_errors[str(home)] = f"{type(e).__name__}: {e}"
+                            if _cycle_exc is None:
+                                _cycle_exc = e
                         except BaseException as e:
                             # THIS profile only; BaseException as in the single-profile loop.
                             logger.error(

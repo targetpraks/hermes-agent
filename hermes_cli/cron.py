@@ -288,7 +288,19 @@ def _job_warnings(job: Dict[str, Any]) -> List[str]:
 
 def cron_tick():
     """Run due jobs once and exit."""
-    from cron.scheduler import CronTickYielded, tick
+    from cron.scheduler import CronTickLockWedged, CronTickYielded, tick
+    # Recovery affordance: if the lock is held by a process that is provably GONE, clear it so a
+    # manual tick can recover the store without an operator hunting pids (safe by construction — see
+    # release_orphaned_tick_lock; a LIVE holder is never touched). This is the documented remedy in
+    # the `hermes cron status` wedge hint (#121904).
+    try:
+        from cron.scheduler import _get_lock_paths, release_orphaned_tick_lock
+
+        if release_orphaned_tick_lock(_get_lock_paths()[1]):
+            print(color("✓ Cleared an orphaned tick lock (its holder process is gone; no tick "
+                        "could ever have released it).", Colors.GREEN))
+    except Exception:
+        pass
     try:
         tick(verbose=True)
     except CronTickYielded as exc:
@@ -296,6 +308,13 @@ def cron_tick():
         print(color(f"✗ {exc}", Colors.YELLOW))
         print("  A fresher gateway process owns the runtime lock and will fire due jobs; this "
               "stale process yielded its tick.")
+        return 1
+    except CronTickLockWedged as exc:
+        # Not contention: the holder cannot be progressing, so nothing will fire until it releases.
+        # Surface the reason and the remedy instead of the old silent, "healthy" success.
+        print(color("✗ Cron tick BLOCKED: the tick lock is held by a wedged process.", Colors.RED))
+        print(f"  {exc}")
+        print(color(_TICK_LOCK_WEDGED_HINT, Colors.YELLOW))
         return 1
     except OSError as exc:
         # Real lock-acquisition failures (EMFILE, EACCES) propagate; they are not contention.
@@ -378,6 +397,11 @@ _PERMISSION_HINT = ("  Hint: jobs.json may be owned by another user (e.g. rewrit
 _FD_EXHAUSTION_HINT = ("  Hint: the ticker hit file-descriptor exhaustion (EMFILE). The scheduler "
                        "now retries with backoff and attempts fd reclamation, but if the leak "
                        "persists, restart the gateway to recover scheduling.")
+_TICK_LOCK_WEDGED_HINT = (
+    "  Hint: another process holds this profile's cron/.tick.lock without making progress — it is "
+    "wedged, so no job can be dispatched until it releases. Find it with "
+    "`lsof ~/.hermes/cron/.tick.lock` (the wedge report above names the pid) and restart that "
+    "process. If it is already gone, `hermes cron tick` clears the orphaned lock.")
 
 
 def _ticker_age_is_fresh(age: Optional[float]) -> bool:
@@ -395,7 +419,7 @@ def _print_ticker_health(pids: list, restart_command: str = "hermes gateway rest
     from cron.jobs import (
         get_ticker_heartbeat_age, get_ticker_last_error, get_ticker_success_age)
     from cron.scheduler import _is_fd_exhaustion_text as _cron_is_fd_exhaustion_text
-    from cron.scheduler import stale_code_yield_labels
+    from cron.scheduler import stale_code_yield_labels, tick_lock_wedged_labels
     hb_age = get_ticker_heartbeat_age()
     ok_age = get_ticker_success_age()
     last_error = get_ticker_last_error()
@@ -424,6 +448,14 @@ def _print_ticker_health(pids: list, restart_command: str = "hermes gateway rest
         print(color(f"  Booted on {skew[0]}, checkout is now at {skew[1]} "
                     "(the code was updated under the running gateway).", Colors.RED))
         print(f"  Restart it onto the new code: {restart_command}")
+    elif (wedge := tick_lock_wedged_labels(last_error)) is not None:
+        # The tick lock is held by a process that cannot be progressing, so dispatch is blocked
+        # outright — the class of stall that used to keep heartbeat + last-success fresh and report
+        # a fully healthy scheduler for 95 minutes while nothing fired (#121904).
+        _warn("⚠ Cron is BLOCKED — the tick lock is held by a wedged process and NOTHING "
+              "can fire.")
+        print(color(f"  {wedge}", Colors.RED))
+        print(color(_TICK_LOCK_WEDGED_HINT, Colors.YELLOW))
     elif (ok_age is not None and not _ticker_age_is_fresh(ok_age)) or (ok_age is None and last_error):
         # Loop alive but every tick fails (or has never succeeded since boot).
         _warn("⚠ Gateway and cron ticker are running, but no tick has "
