@@ -74,6 +74,73 @@ from hermes_cli.web_server_lifecycle import (  # noqa: E402
 )
 
 
+def _desktop_profile_gate(name: str, home) -> bool:
+    """May the Desktop ticker tick ``(name, home)``? False when a live gateway owns it.
+
+    Fail-safe direction: this returns True (allow the tick) ONLY when no live gateway can be proven
+    — a Desktop install with no gateway at all is the case this ticker exists for. Every "a gateway
+    IS up" proof is consulted, because a false negative here is not a missed tick: it is TWO tickers
+    on one store, which is how the 2026-09-25 default-store fire-claim storm happened.
+
+    Rungs, each guarded INDIVIDUALLY (a rung that raises must fall through to the next one, never
+    short-circuit the remaining proofs):
+
+    1. The profile's OWN gateway (``gateway.pid`` + runtime lock) — the historical single term, kept
+       first because a dedicated ``hermes -p X serve`` gateway writes its own identity.
+    2. The host multiplexer via ``host_gateway_topology``. **This is the fix for the DEFAULT
+       profile.** ``_served_by_running_multiplexer`` returns False unconditionally for ``default``
+       (its ``suffix == "default"`` guard), so the old gate's ``or`` branch was dead code for exactly
+       the profile carrying most jobs — leaving one point-in-time identity-file probe as the sole
+       rung. While the host record is mid-write (gateway restart / host-role re-election) that probe
+       reports "unowned" although the gateway is alive, and the Desktop ticks its store.
+    3. ``_served_by_running_multiplexer`` for named profiles — kept so a satellite named in
+       ``served_profiles`` still stands down if rung 2 is unavailable.
+    """
+    home = Path(home)
+    proof = None
+    try:
+        from hermes_cli.profiles import _check_gateway_running
+
+        proof = _check_gateway_running(home)
+    except Exception:
+        _log.debug("Desktop cron gate: own-gateway probe failed for %s", name, exc_info=True)
+    if proof:
+        return False
+    try:
+        from gateway.host_topology import host_gateway_serving
+
+        proof = host_gateway_serving(name) is not None
+    except Exception:
+        _log.debug("Desktop cron gate: host topology probe failed for %s", name, exc_info=True)
+    if proof:
+        return False
+    try:
+        from hermes_cli.profiles import _served_by_running_multiplexer
+
+        proof = name != "default" and _served_by_running_multiplexer(name)
+    except Exception:
+        _log.debug("Desktop cron gate: multiplexer probe failed for %s", name, exc_info=True)
+    if proof:
+        return False
+    return True
+
+
+def _active_profile_only_homes() -> list:
+    """``[(active_profile_name, hermes_home)]`` for the process's own profile, without enumerating.
+
+    Used as the served set when profile enumeration raises. Deliberately does NOT call
+    ``profiles_to_serve``: that is the callable that just failed, and a fallback that re-runs it
+    would simply raise again inside the tick (``_existing_profile_homes`` then yields ZERO homes,
+    silently killing the very profile this branch exists to keep firing). Nothing here lists
+    ``profiles/`` — the active profile is derived from ``HERMES_HOME``, so it cannot fail the way
+    enumeration does.
+    """
+    from hermes_cli.profiles import get_active_profile_name
+    from hermes_constants import get_process_hermes_home
+
+    return [(get_active_profile_name(), get_process_hermes_home())]
+
+
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
     """Tick the cron scheduler from inside the desktop dashboard backend.
 
@@ -97,8 +164,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     start_kwargs: dict = {"interval": interval}
     if isinstance(provider, InProcessCronScheduler):
         try:
-            from hermes_cli.profiles import (
-                _check_gateway_running, _served_by_running_multiplexer, profiles_to_serve)
+            from hermes_cli.profiles import profiles_to_serve
 
             # Same served set as the multiplexer: default + every live profile under profiles/.
             # The ticker re-enumerates this callable every cycle. Passing a
@@ -115,9 +181,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
                 # process, or the live default multiplexer (a served satellite has no gateway.pid
                 # of its own). That gateway ticks with live adapters; winning the tick-lock race
                 # here would deliver through the standalone path (#100489, #107485).
-                start_kwargs["profile_gate"] = lambda name, home: not (
-                    _check_gateway_running(Path(home))
-                    or (name != "default" and _served_by_running_multiplexer(name)))
+                start_kwargs["profile_gate"] = _desktop_profile_gate
                 from hermes_logging import enable_profile_log_routing
 
                 enable_profile_log_routing(initial_profile_homes)
@@ -127,8 +191,15 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
                     [name for name, _home in initial_profile_homes],
                 )
         except Exception:
-            # Fail open to the single-store ticker so the active profile keeps firing.
+            # Fail open to the single-store ticker so the active profile keeps firing — but NOT to an
+            # UNGATED one. The bare single-store path ignores ``profile_gate`` entirely, so falling
+            # through to it here (as this branch used to) is how a Desktop backend ends up racing a
+            # live gateway for the default store. Instead keep the MULTIPLEX path, with the served
+            # set narrowed to just the active profile: ``profile_homes`` is what the enumerator that
+            # just raised would have supplied, and ``profile_gate`` is still consulted every tick.
             _log.exception("Desktop cron: profile enumeration failed; ticking active profile only")
+            start_kwargs["profile_homes"] = _active_profile_only_homes
+            start_kwargs["profile_gate"] = _desktop_profile_gate
 
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
     provider.start(stop_event, **start_kwargs)

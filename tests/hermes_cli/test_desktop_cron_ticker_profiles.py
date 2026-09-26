@@ -102,10 +102,24 @@ def test_single_profile_ticks_only_without_gateway(monkeypatch, tmp_path, gatewa
     assert ticked == ([] if gateway_running else [home])
 
 
-def test_enumeration_failure_fails_open(monkeypatch, _providers):
-    """The active profile's jobs keep firing even if profile listing breaks."""
+def test_enumeration_failure_fails_open_but_stays_gated(monkeypatch, _providers):
+    """The active profile's jobs keep firing even if profile listing breaks.
+
+    UPDATED for the 2026-09-25 duplicate-ticker fix. This test previously asserted
+    ``start_kwargs == {"interval": 11}`` — i.e. that a *bare, ungated* single-store ticker was
+    installed. That is exactly the hole being fixed: the bare path ignores ``profile_gate``
+    entirely, so on the real host it let a Desktop backend tick the DEFAULT store while the
+    multiplex gateway was alive and serving it (two tickers on one store; the gateway's rows then
+    died with "Fire claim lost; execution was not started.").
+
+    Failing open is still right for the SERVED SET — the active profile must keep firing — but it
+    must not drop the gateway gate. ``profile_homes`` therefore becomes
+    ``_active_profile_only_homes`` (which does NOT re-run the enumerator that just raised), and
+    ``profile_gate`` stays installed.
+    """
     _sp, builtin = _providers
     import hermes_cli.profiles as profiles_mod
+    import hermes_cli.web_server as ws
 
     def _boom(**_kw):
         raise RuntimeError("profiles dir unreadable")
@@ -114,7 +128,14 @@ def test_enumeration_failure_fails_open(monkeypatch, _providers):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=11)
 
-    assert builtin.start_kwargs == {"interval": 11}
+    assert builtin.start_kwargs["interval"] == 11
+    assert builtin.start_kwargs.get("profile_gate") is ws._desktop_profile_gate, (
+        "an enumeration failure fell back to an UNGATED ticker")
+    profile_homes = builtin.start_kwargs.get("profile_homes")
+    assert profile_homes is ws._active_profile_only_homes, (
+        "the fail-open fallback must resolve the active profile without re-enumerating")
+    homes = profile_homes()
+    assert len(homes) == 1 and isinstance(homes[0], tuple) and len(homes[0]) == 2, homes
 
 
 def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):
